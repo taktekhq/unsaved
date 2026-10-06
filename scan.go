@@ -19,6 +19,7 @@ type Finding struct {
 	Branch string   `json:"branch,omitempty"` // for unpushed
 	Files  []string `json:"files,omitempty"`  // a sample, relative to Path
 	Pushed bool     `json:"pushed,omitempty"` // --push sent it
+	Error  string   `json:"error,omitempty"`  // why --push couldn't
 }
 
 // Directories never worth descending into.
@@ -65,6 +66,15 @@ func git(dir string, args ...string) (string, error) {
 	cmd.Stdout = &out
 	err := cmd.Run()
 	return strings.TrimRight(out.String(), "\n"), err
+}
+
+// lastLine keeps the line of git's output that says what went wrong.
+func lastLine(out string, err error) string {
+	ls := lines(strings.TrimSpace(out))
+	if len(ls) == 0 {
+		return err.Error()
+	}
+	return strings.TrimPrefix(strings.TrimPrefix(ls[len(ls)-1], "fatal: "), "error: ")
 }
 
 func lines(s string) []string {
@@ -154,8 +164,10 @@ func checkRepo(top string, seen map[string]bool, push bool) []Finding {
 		// Only a plain fast-forward to the branch's own upstream is pushed: never a new
 		// remote branch, never a force.
 		if push && b.remote != "" && strings.HasPrefix(b.track, "[ahead") && !strings.Contains(b.track, "behind") {
-			_, err := git(top, "push", "--quiet", b.remote, "refs/heads/"+b.name+":"+b.remoteRef)
-			f.Pushed = err == nil
+			out, err := exec.Command("git", "-C", top, "push", "--quiet", b.remote, "refs/heads/"+b.name+":"+b.remoteRef).CombinedOutput()
+			if f.Pushed = err == nil; !f.Pushed {
+				f.Error = lastLine(string(out), err)
+			}
 		}
 		fs = append(fs, f)
 	}

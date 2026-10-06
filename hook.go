@@ -210,6 +210,8 @@ func describe(f Finding) string {
 		s := plural(f.Count, "unpushed commit") + " on " + f.Branch
 		if f.Pushed {
 			s += " (pushed now)"
+		} else if f.Error != "" {
+			s += " (push failed: " + f.Error + ")"
 		}
 		return s
 	case "no-remote":
