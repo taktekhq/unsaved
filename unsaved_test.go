@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func run(t *testing.T, dir string, args ...string) {
@@ -112,8 +113,20 @@ func TestPush(t *testing.T) {
 }
 
 func transcript(t *testing.T, files ...string) string {
+	return transcriptWith(t, time.Now().Add(-time.Hour), "", "", files...)
+}
+
+// transcriptWith starts the session at start, in cwd, and runs one shell command.
+func transcriptWith(t *testing.T, start time.Time, cwd, command string, files ...string) string {
 	var b strings.Builder
-	b.WriteString(`{"type":"user","message":{"content":"hi"}}` + "\n")
+	first, _ := json.Marshal(map[string]any{"type": "user", "timestamp": start, "cwd": cwd, "message": map[string]any{"content": "hi"}})
+	b.Write(append(first, '\n'))
+	if command != "" {
+		line, _ := json.Marshal(map[string]any{"type": "assistant", "cwd": cwd, "message": map[string]any{"content": []any{
+			map[string]any{"type": "tool_use", "name": "Bash", "input": map[string]any{"command": command}},
+		}}})
+		b.Write(append(line, '\n'))
+	}
 	for _, f := range files {
 		line, _ := json.Marshal(map[string]any{"type": "assistant", "message": map[string]any{"content": []any{
 			map[string]any{"type": "tool_use", "name": "Write", "input": map[string]any{"file_path": f}},
@@ -193,5 +206,34 @@ func TestHookDoesNotLoop(t *testing.T) {
 	t.Setenv("UNSAVED_HOOK", "off")
 	if res := hook(t, p); res != nil {
 		t.Fatalf("UNSAVED_HOOK=off still blocked: %v", res)
+	}
+}
+
+func TestHookSeesShellEdits(t *testing.T) {
+	work := fixture(t)
+	repo := filepath.Join(work, "clean")
+	write(t, filepath.Join(repo, "a.go"), "package a // sed\n")
+	write(t, filepath.Join(repo, "other.go"), "package a // someone else\n")
+	res := hook(t, map[string]any{
+		"transcript_path": transcriptWith(t, time.Now().Add(-time.Minute), repo, "sed -i '' s/x/y/ a.go"),
+		"cwd":             repo,
+	})
+	if !strings.Contains(res["reason"], "a.go") {
+		t.Fatalf("shell edit missed: %v", res)
+	}
+	if strings.Contains(res["reason"], "other.go") {
+		t.Errorf("blamed this session for a file its commands never named:\n%s", res["reason"])
+	}
+}
+
+func TestHookIgnoresChangesFromBeforeTheSession(t *testing.T) {
+	work := fixture(t)
+	repo := filepath.Join(work, "dirty") // b.go was written before this session started
+	res := hook(t, map[string]any{
+		"transcript_path": transcriptWith(t, time.Now().Add(time.Minute), repo, "cat b.go"),
+		"cwd":             repo,
+	})
+	if res != nil {
+		t.Fatalf("blocked on an older change: %v", res)
 	}
 }

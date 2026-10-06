@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // hookInput is what Claude Code sends a Stop hook on stdin.
@@ -22,27 +24,47 @@ type hookInput struct {
 // Tools whose input names a file the agent wrote.
 var writeTools = map[string]bool{"Edit": true, "Write": true, "MultiEdit": true, "NotebookEdit": true}
 
-// touchedFiles returns every file the session wrote with an editing tool, as absolute paths.
-func touchedFiles(transcript, cwd string) []string {
+// session is what the transcript says the agent did.
+type session struct {
+	files    []string  // written with an editing tool, absolute
+	dirs     []string  // every working directory the session had
+	start    time.Time // first entry
+	commands string    // every shell command it ran, to recognise files it changed without an editing tool
+}
+
+func readSession(transcript, cwd string) session {
+	var s session
+	if cwd != "" {
+		s.dirs = append(s.dirs, filepath.Clean(cwd))
+	}
 	f, err := os.Open(transcript)
 	if err != nil {
-		return nil
+		return s
 	}
 	defer f.Close()
-	set := map[string]bool{}
+	files, dirs := map[string]bool{}, map[string]bool{}
+	var cmds strings.Builder
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 1<<20), 64<<20)
 	for sc.Scan() {
-		line := sc.Bytes()
-		if !strings.Contains(string(line), `"tool_use"`) {
-			continue
-		}
 		var entry struct {
-			Message struct {
+			Timestamp time.Time `json:"timestamp"`
+			Cwd       string    `json:"cwd"`
+			Message   struct {
 				Content json.RawMessage `json:"content"`
 			} `json:"message"`
 		}
-		if json.Unmarshal(line, &entry) != nil {
+		if json.Unmarshal(sc.Bytes(), &entry) != nil {
+			continue
+		}
+		if s.start.IsZero() && !entry.Timestamp.IsZero() {
+			s.start = entry.Timestamp
+		}
+		if entry.Cwd != "" && !dirs[entry.Cwd] {
+			dirs[entry.Cwd] = true
+			s.dirs = append(s.dirs, filepath.Clean(entry.Cwd))
+		}
+		if !bytes.Contains(sc.Bytes(), []byte(`"tool_use"`)) {
 			continue
 		}
 		var blocks []struct {
@@ -51,34 +73,52 @@ func touchedFiles(transcript, cwd string) []string {
 			Input struct {
 				FilePath     string `json:"file_path"`
 				NotebookPath string `json:"notebook_path"`
+				Command      string `json:"command"`
 			} `json:"input"`
 		}
 		if json.Unmarshal(entry.Message.Content, &blocks) != nil {
 			continue
 		}
 		for _, b := range blocks {
-			if b.Type != "tool_use" || !writeTools[b.Name] {
+			if b.Type != "tool_use" {
 				continue
+			}
+			if b.Input.Command != "" {
+				cmds.WriteString(b.Input.Command)
+				cmds.WriteByte('\n')
 			}
 			p := b.Input.FilePath
 			if p == "" {
 				p = b.Input.NotebookPath
 			}
-			if p == "" {
+			if !writeTools[b.Name] || p == "" {
 				continue
 			}
 			if !filepath.IsAbs(p) {
 				p = filepath.Join(cwd, p)
 			}
-			set[filepath.Clean(p)] = true
+			files[filepath.Clean(p)] = true
 		}
 	}
-	var out []string
-	for p := range set {
-		out = append(out, p)
+	for p := range files {
+		s.files = append(s.files, p)
 	}
-	sort.Strings(out)
-	return out
+	sort.Strings(s.files)
+	s.commands = cmds.String()
+	return s
+}
+
+// changedByCommand reports whether a shell command of this session probably changed path:
+// the file changed after the session began and a command names it.
+func (s session) changedByCommand(path, rel string) bool {
+	if s.start.IsZero() || s.commands == "" {
+		return false
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.ModTime().Before(s.start) {
+		return false
+	}
+	return strings.Contains(s.commands, rel) || strings.Contains(s.commands, filepath.Base(path))
 }
 
 // Places an agent writes on purpose without meaning to keep anything.
@@ -93,12 +133,12 @@ var scratchPrefixes = func() []string {
 	return ps
 }
 
-// hookReport checks the files a session touched and says what is still unsaved.
-func hookReport(touched []string, ignore []string) []Finding {
+// hookReport checks what a session changed and says what is still unsaved.
+func hookReport(s session, ignore []string) []Finding {
 	ignore = append(append([]string{}, ignore...), scratchPrefixes()...)
 	byRepo := map[string][]string{}
 	var loose []string
-	for _, p := range touched {
+	for _, p := range s.files {
 		if ignored(p, ignore) {
 			continue
 		}
@@ -110,6 +150,13 @@ func hookReport(touched []string, ignore []string) []Finding {
 			continue
 		}
 		byRepo[top] = append(byRepo[top], p)
+	}
+	for _, d := range s.dirs {
+		if top := repoTop(d); top != "" && !ignored(top, ignore) {
+			if _, ok := byRepo[top]; !ok {
+				byRepo[top] = nil
+			}
+		}
 	}
 	var out []Finding
 	tops := make([]string, 0, len(byRepo))
@@ -124,14 +171,22 @@ func hookReport(touched []string, ignore []string) []Finding {
 		}
 		// Only this session's files: another session may be mid-change in the same repo.
 		var mine []string
+		edited := map[string]bool{}
 		for _, p := range byRepo[top] {
-			if dirty[p] {
-				rel, _ := filepath.Rel(top, p)
+			edited[p] = true
+		}
+		for p := range dirty {
+			rel, _ := filepath.Rel(top, p)
+			if edited[p] || s.changedByCommand(p, rel) {
 				mine = append(mine, rel)
 			}
 		}
+		sort.Strings(mine)
 		if len(mine) > 0 {
 			out = append(out, Finding{Path: top, Kind: "dirty", Count: len(mine), Files: sample(mine, 8)})
+		}
+		if len(byRepo[top]) == 0 && len(mine) == 0 {
+			continue // only passed through this repo; its other state isn't this session's business
 		}
 		if remotes, _ := git(top, "remote"); remotes == "" {
 			out = append(out, Finding{Path: top, Kind: "no-remote"})
@@ -167,7 +222,7 @@ func runHook(stdin io.Reader, stdout io.Writer, ignore []string, note string) er
 	if in.StopHookActive {
 		return nil // already asked once this stop; don't loop
 	}
-	fs := hookReport(touchedFiles(in.TranscriptPath, in.Cwd), ignore)
+	fs := hookReport(readSession(in.TranscriptPath, in.Cwd), ignore)
 	if len(fs) == 0 {
 		return nil
 	}

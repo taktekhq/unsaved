@@ -69,7 +69,7 @@ Add this to `~/.claude/settings.json` (or a project's `.claude/settings.json`):
 }
 ```
 
-When the agent stops, the hook reads the session's transcript, collects every file written with `Edit`, `Write`, `MultiEdit` or `NotebookEdit`, and checks only those:
+When the agent stops, the hook reads the session's transcript and works out which files the session changed: every file written with `Edit`, `Write`, `MultiEdit` or `NotebookEdit`, plus files in the repositories it worked in that changed after the session began and that one of its shell commands names (`sed -i … config.py`). It checks only those:
 
 - a file this session changed that isn't committed;
 - unpushed commits on the current branch of a repository this session touched;
