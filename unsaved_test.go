@@ -183,6 +183,29 @@ func TestHookIgnoresOtherSessionsFiles(t *testing.T) {
 	}
 }
 
+func TestHookFollowsLinkedFolders(t *testing.T) {
+	work := fixture(t)
+	// Tools keep memory in a folder that is a link to a subfolder of a repository.
+	clean := filepath.Join(work, "clean")
+	write(t, filepath.Join(clean, "memory/note.md"), "a\n")
+	run(t, clean, "git", "add", ".")
+	run(t, clean, "git", "commit", "-q", "-m", "note")
+	run(t, clean, "git", "push", "-q")
+	link := filepath.Join(work, "..", "tool-home", "memory")
+	os.MkdirAll(filepath.Dir(link), 0o755)
+	os.Symlink(filepath.Join(clean, "memory"), link)
+
+	res := hook(t, map[string]any{"transcript_path": transcript(t, filepath.Join(link, "note.md")), "cwd": work})
+	if res != nil {
+		t.Fatalf("committed file behind a link: want no block, got %v", res)
+	}
+	write(t, filepath.Join(clean, "memory/note.md"), "b\n")
+	res = hook(t, map[string]any{"transcript_path": transcript(t, filepath.Join(link, "note.md")), "cwd": work})
+	if res["decision"] != "block" || strings.Contains(res["reason"], "not in git") {
+		t.Fatalf("uncommitted file behind a link: want a block for an uncommitted file, got %v", res)
+	}
+}
+
 func TestHookUnpushedAndNoRemote(t *testing.T) {
 	work := fixture(t)
 	res := hook(t, map[string]any{

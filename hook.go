@@ -142,6 +142,9 @@ func hookReport(s session, ignore []string) []Finding {
 		if ignored(p, ignore) {
 			continue
 		}
+		if dir, err := filepath.EvalSymlinks(filepath.Dir(p)); err == nil {
+			p = filepath.Join(dir, filepath.Base(p)) // match the paths git reports
+		}
 		top := repoTop(filepath.Dir(p))
 		if top == "" {
 			if _, err := os.Stat(p); err == nil {

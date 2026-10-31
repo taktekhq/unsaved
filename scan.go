@@ -230,7 +230,11 @@ func Scan(roots []string, depth int, ignore []string, push bool) []Finding {
 }
 
 // repoTop returns the worktree that contains path, or "" when it is in none.
+// Links are resolved first: a linked folder that points into a repository is in it.
 func repoTop(path string) string {
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		path = real
+	}
 	for d := path; ; {
 		if _, err := os.Lstat(filepath.Join(d, ".git")); err == nil {
 			return d
